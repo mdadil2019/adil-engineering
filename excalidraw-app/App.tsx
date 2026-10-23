@@ -132,7 +132,8 @@ import {
 import { isBrowserStorageStateNewer } from "./data/tabSync";
 import { ShareDialog, shareDialogStateAtom } from "./share/ShareDialog";
 import CollabError, { collabErrorIndicatorAtom } from "./collab/CollabError";
-import { useHandleAppTheme } from "./useHandleAppTheme";
+import { WorkspaceApp } from "./workspace/WorkspaceApp";
+
 import { getPreferredLanguage } from "./app-language/language-detector";
 import { useAppLangCode } from "./app-language/language-state";
 import DebugCanvas, {
@@ -150,6 +151,7 @@ import { ExcalidrawPlusPromoBanner } from "./components/ExcalidrawPlusPromoBanne
 import { AppSidebar } from "./components/AppSidebar";
 
 import type { CollabAPI } from "./collab/Collab";
+import type { WorkspaceEditorProps } from "./workspace/WorkspaceApp";
 
 polyfill();
 
@@ -372,13 +374,23 @@ const initializeScene = async (opts: {
   return { scene: null, isExternalScene: false };
 };
 
-const ExcalidrawWrapper = () => {
+const ExcalidrawWrapper = ({
+  initialScene,
+  loadInitialSceneFromURL,
+  onWorkspaceChange,
+  onWorkspaceReady,
+  busy,
+  theme,
+}: WorkspaceEditorProps) => {
   const excalidrawAPI = useExcalidrawAPI();
+  const appContainerRef = useRef<HTMLDivElement>(null);
+  const workspaceSceneRef = useRef(initialScene);
+  const loadInitialURLRef = useRef(loadInitialSceneFromURL);
 
   const [errorMessage, setErrorMessage] = useState("");
   const isCollabDisabled = isRunningInIframe();
 
-  const { editorTheme, appTheme, setAppTheme } = useHandleAppTheme();
+  const { editorTheme, appTheme, setAppTheme } = theme;
 
   const [langCode, setLangCode] = useAppLangCode();
 
@@ -562,10 +574,24 @@ const ExcalidrawWrapper = () => {
       return;
     }
 
-    initializeScene({ collabAPI, excalidrawAPI }).then(async (data) => {
-      loadImages(data, /* isInitialLoad */ true);
-      initialStatePromiseRef.current.promise.resolve(data.scene);
-    });
+    // Each canvas mounts a fresh editor, with its own scene, files and history.
+    // WorkspaceApp has already restored the legacy drawing or workspace file.
+    const location =
+      appContainerRef.current?.ownerDocument.defaultView?.location;
+    const hasExternalScene =
+      location &&
+      (new URLSearchParams(location.search).has("id") ||
+        /^#(?:json|url|room)=/.test(location.hash));
+    if (loadInitialURLRef.current && hasExternalScene) {
+      initializeScene({ collabAPI, excalidrawAPI }).then((data) => {
+        loadImages(data);
+        initialStatePromiseRef.current.promise.resolve(
+          data.scene || workspaceSceneRef.current,
+        );
+      });
+    } else {
+      initialStatePromiseRef.current.promise.resolve(workspaceSceneRef.current);
+    }
 
     const onHashChange = async (event: HashChangeEvent) => {
       event.preventDefault();
@@ -595,6 +621,10 @@ const ExcalidrawWrapper = () => {
     };
 
     const syncData = debounce(() => {
+      // The original single-canvas browser storage must not replace a workspace canvas.
+      if (workspaceSceneRef.current) {
+        return;
+      }
       if (isTestEnv()) {
         return;
       }
@@ -717,13 +747,14 @@ const ExcalidrawWrapper = () => {
     appState: AppState,
     files: BinaryFiles,
   ) => {
+    onWorkspaceChange(elements, appState, files);
     if (collabAPI?.isCollaborating()) {
       collabAPI.syncElements(elements);
     }
 
     // this check is redundant, but since this is a hot path, it's best
     // not to evaludate the nested expression every time
-    if (!LocalData.isSavePaused()) {
+    if (!workspaceSceneRef.current && !LocalData.isSavePaused()) {
       LocalData.save(elements, appState, files, () => {
         if (excalidrawAPI) {
           let didChange = false;
@@ -948,12 +979,15 @@ const ExcalidrawWrapper = () => {
 
   return (
     <div
+      ref={appContainerRef}
       style={{ height: "100%" }}
-      className={clsx("excalidraw-app", {
+      className={clsx("excalidraw-app workspace-editor", {
         "is-collaborating": isCollaborating,
       })}
     >
       <Excalidraw
+        onInitialize={onWorkspaceReady}
+        interaction={!busy}
         viewportStatusFrame={viewportStatusFrame}
         userToFollow={userToFollow}
         onChange={onChange}
@@ -1320,9 +1354,13 @@ const ExcalidrawApp = () => {
   return (
     <TopErrorBoundary>
       <Provider store={appJotaiStore}>
-        <ExcalidrawAPIProvider>
-          <ExcalidrawWrapper />
-        </ExcalidrawAPIProvider>
+        <WorkspaceApp
+          renderEditor={(props, key) => (
+            <ExcalidrawAPIProvider key={key}>
+              <ExcalidrawWrapper {...props} />
+            </ExcalidrawAPIProvider>
+          )}
+        />
       </Provider>
     </TopErrorBoundary>
   );
